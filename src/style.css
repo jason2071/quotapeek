@@ -32,11 +32,10 @@ body {
 /* ---------- Glass card ---------- */
 .card {
   position: relative;
-  height: 100%;
   display: flex;
   flex-direction: column;
   gap: 13px;
-  padding: 15px 16px 11px;
+  padding: 15px 16px 12px;
   border-radius: var(--radius);
   background: linear-gradient(
     160deg,
@@ -231,7 +230,6 @@ body {
 
 /* ---------- Footer ---------- */
 .footer {
-  margin-top: auto;
   padding-top: 9px;
   border-top: 1px solid var(--line);
   display: flex;

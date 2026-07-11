@@ -157,7 +157,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION)
+                // Persist POSITION only — widgets auto-fit their size to content.
+                .with_state_flags(StateFlags::POSITION)
                 .build(),
         )
         .plugin(tauri_plugin_autostart::init(

@@ -1,5 +1,6 @@
 import "./style.css";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { getSettings, getUsage, notify, reportUsage } from "./api";
 import { countdownText, renderSnapshot } from "./render";
 import type { UsageSnapshot } from "./types";
@@ -37,6 +38,23 @@ function paint(s: UsageSnapshot): void {
   renderSnapshot(app, s, Date.now(), provider);
   const btn = app.querySelector<HTMLButtonElement>(".js-refresh");
   if (btn) btn.addEventListener("click", manualRefresh);
+  fitToContent();
+}
+
+// Resize the window to exactly fit the card content (no clipping, no empty glass).
+let lastFitH = 0;
+function fitToContent(): void {
+  const card = app.querySelector<HTMLElement>(".card");
+  if (!card) return;
+  requestAnimationFrame(() => {
+    const rect = card.getBoundingClientRect();
+    const h = Math.ceil(rect.height);
+    const w = Math.round(rect.width) || 344;
+    if (h > 0 && Math.abs(h - lastFitH) > 1) {
+      lastFitH = h;
+      void getCurrentWindow().setSize(new LogicalSize(w, h)).catch(() => {});
+    }
+  });
 }
 
 async function load(force = false): Promise<void> {
