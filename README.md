@@ -118,15 +118,19 @@ endpoint (`plugins.updater.endpoints` in `tauri.conf.json` → GitHub Releases
 `latest.json`). To publish an update:
 
 1. Bump `version` in `tauri.conf.json`.
-2. Build with the signing key set (produces signed artifacts + `latest.json`):
-   ```bash
-   # PowerShell: set the key content from src-tauri/quotapeek-updater.key
-   $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content src-tauri/quotapeek-updater.key -Raw
-   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+2. Build with the signing key. Point the env var at the key **file path** — passing
+   the raw content via `Get-Content -Raw` appends a newline and breaks signing with
+   "incorrect updater private key password":
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY = (Resolve-Path src-tauri/quotapeek-updater.key).Path
+   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""   # key was generated without a password
    npm run tauri build
    ```
-3. Upload the artifacts + `latest.json` to a GitHub Release on the repo the
-   endpoint points to.
+   Output (verified): `src-tauri/target/release/bundle/msi/*.msi`,
+   `.../nsis/*-setup.exe`, plus `*.sig` updater signatures next to each.
+3. Create a `latest.json` (version, notes, pub_date, and per-platform `url` +
+   `signature` = the `.sig` contents) and upload it with the installers to a GitHub
+   Release on the repo the endpoint points to.
 
 The private key `src-tauri/quotapeek-updater.key` is git-ignored — **keep it safe;
 losing it breaks updates.** The public key is in `tauri.conf.json`.
