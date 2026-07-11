@@ -14,7 +14,7 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::MacosLauncher;
-use tauri_plugin_window_state::StateFlags;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 const WIDGETS: [&str; 2] = ["claude", "codex"];
 const DEFAULT_POS: [(&str, i32, i32); 2] = [("claude", 60, 60), ("codex", 420, 60)];
@@ -262,6 +262,8 @@ pub fn run() {
                     }
                     "quit" => {
                         tracing::info!("quit from tray");
+                        // Persist positions before exiting (don't rely on exit timing).
+                        let _ = app.save_window_state(StateFlags::POSITION);
                         app.exit(0)
                     }
                     _ => {}
@@ -300,7 +302,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "settings" {
+                // Never destroy a window (would break tray re-show) — hide instead.
+                let label = window.label();
+                if label == "settings" || label == "claude" || label == "codex" {
                     let _ = window.hide();
                     api.prevent_close();
                 }
