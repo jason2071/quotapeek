@@ -5,3 +5,6 @@ src-tauri/target
 src-tauri/gen/schemas
 *.log
 .claude/*.lock
+
+# Updater signing private key — NEVER commit
+src-tauri/*.key

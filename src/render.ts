@@ -2,6 +2,19 @@ import type { Bucket, ExtraBucket, Severity, UsageSnapshot } from "./types";
 
 const WEEKDAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
+const HTML_ENTITIES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+// Escape server/error-derived strings before they go into innerHTML.
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => HTML_ENTITIES[c]);
+}
+
 function clampPct(n: number): number {
   return Math.max(0, Math.min(100, n));
 }
@@ -22,6 +35,18 @@ function severityClass(sev: Severity): string {
   if (sev === "critical") return "sev-critical";
   if (sev === "warning") return "sev-warning";
   return "sev-normal";
+}
+
+// Non-color severity cue (color-blind users can't rely on bar color alone).
+function sevGlyph(sev: Severity): string {
+  if (sev === "critical") return `<span class="sev-mark" title="Critical" aria-label="critical">⛔</span> `;
+  if (sev === "warning") return `<span class="sev-mark" title="Warning" aria-label="warning">⚠</span> `;
+  return "";
+}
+
+function barAria(label: string, usedPct: number, approx: boolean): string {
+  if (approx) return `role="progressbar" aria-label="${esc(label)} usage (approximate)"`;
+  return `role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(usedPct)}" aria-label="${esc(label)} usage"`;
 }
 
 // "Resets in 4hr 31min" from an epoch-ms reset time.
@@ -66,13 +91,13 @@ function barRow(opts: {
   return `
     <div class="row">
       <div class="row-head">
-        <div class="row-label">${opts.label}</div>
-        <div class="row-pct">${pctLabel(opts.usedPct, opts.tokens)}</div>
+        <div class="row-label">${esc(opts.label)}</div>
+        <div class="row-pct">${sevGlyph(opts.severity)}${pctLabel(opts.usedPct, opts.tokens)}</div>
       </div>
-      <div class="bar bar-${variant} ${severityClass(opts.severity)}${approx ? " bar-approx" : ""}">
+      <div class="bar bar-${variant} ${severityClass(opts.severity)}${approx ? " bar-approx" : ""}" ${barAria(opts.label, opts.usedPct, approx)}>
         <div class="bar-fill" style="width:${approx ? 0 : clampPct(opts.usedPct)}%"></div>
       </div>
-      <div class="row-sub">${opts.sub}</div>
+      <div class="row-sub">${esc(opts.sub)}</div>
     </div>`;
 }
 
@@ -85,9 +110,9 @@ function sessionRow(b: Bucket | null, now: number): string {
     <div class="row" data-countdown="${b.resetsAt ?? ""}">
       <div class="row-head">
         <div class="row-label">Current session</div>
-        <div class="row-pct">${pctLabel(b.usedPct, b.tokens)}</div>
+        <div class="row-pct">${sevGlyph(b.severity)}${pctLabel(b.usedPct, b.tokens)}</div>
       </div>
-      <div class="bar bar-session ${severityClass(b.severity)}${approx ? " bar-approx" : ""}">
+      <div class="bar bar-session ${severityClass(b.severity)}${approx ? " bar-approx" : ""}" ${barAria("Current session", b.usedPct, approx)}>
         <div class="bar-fill" style="width:${approx ? 0 : clampPct(b.usedPct)}%"></div>
       </div>
       <div class="row-sub js-countdown">${countdownText(b.resetsAt, now)}</div>
@@ -113,7 +138,7 @@ function statusBanner(s: UsageSnapshot): string {
     return `<div class="banner banner-warn">Rate limited — backing off. Showing last known values.</div>`;
   }
   if (s.status === "error") {
-    return `<div class="banner banner-err">${s.error ?? "Failed to load usage"}</div>`;
+    return `<div class="banner banner-err">${esc(s.error ?? "Failed to load usage")}</div>`;
   }
   return "";
 }
@@ -161,7 +186,7 @@ export function renderSnapshot(
     <div class="card">
       <div class="titlebar" data-tauri-drag-region>
         <div class="title" data-tauri-drag-region>${title}</div>
-        <div class="plan">${s.plan}</div>
+        <div class="plan">${esc(s.plan)}</div>
       </div>
 
       ${statusBanner(s)}
@@ -177,12 +202,10 @@ export function renderSnapshot(
         ${s.extraBuckets.map(extraRow).join("")}
       </div>
 
-      ${creditsSection(s)}
-
       <div class="footer">
         <div class="footer-row">
           <div class="updated">Last updated: <span class="js-updated">${relativeTime(s.fetchedAt, now)}</span> ${staleBadge(s)}</div>
-          <button class="refresh js-refresh" title="Refresh">⟳</button>
+          <button class="refresh js-refresh" title="Refresh" aria-label="Refresh usage">⟳</button>
         </div>
       </div>
     </div>`;
@@ -195,16 +218,3 @@ function approxNote(s: UsageSnapshot): string {
   return "";
 }
 
-function creditsSection(s: UsageSnapshot): string {
-  const c = s.credits;
-  if (!c) return "";
-  const amount = `${c.currency === "USD" ? "$" : ""}${c.spent.toFixed(2)}`;
-  return `
-    <div class="section credits">
-      <div class="section-title">Usage credits</div>
-      <div class="row-head">
-        <div class="row-label muted">${amount} spent</div>
-        <div class="row-pct muted">${c.enabled ? `${Math.round(c.percent)}% used` : "off"}</div>
-      </div>
-    </div>`;
-}

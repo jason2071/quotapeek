@@ -178,6 +178,21 @@ body {
   color: var(--muted);
 }
 
+.sev-mark {
+  font-size: 11px;
+  vertical-align: baseline;
+}
+
+/* Let users select/copy the numbers even though the card is otherwise unselectable. */
+.row-label,
+.row-pct,
+.row-sub,
+.section-title,
+.updated {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 /* ---------- Credits ---------- */
 .credits .row-head {
   margin-top: 2px;

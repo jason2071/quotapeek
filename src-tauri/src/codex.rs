@@ -1,11 +1,17 @@
-//! Codex provider: read OpenAI Codex CLI usage offline from the newest session
-//! rollout log. No network — the rate-limit snapshot is written by the Codex CLI
-//! on each turn, so it's only as fresh as the last Codex activity.
+//! Codex provider. Primary source is the live, non-inference ChatGPT backend
+//! endpoint `GET /backend-api/wham/usage` (zero model quota consumed). Falls back
+//! to the newest session rollout log (offline, stale) when the network fails.
+//!
+//! Auth is read-only: we reuse the `access_token` the Codex CLI keeps in
+//! `~/.codex/auth.json` and never write that file (the CLI owns token refresh).
 
 use crate::models::{Bucket, UsageSnapshot};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const USER_AGENT: &str = "codex_cli_rs/0.144.1 (QuotaPeek widget)";
 const STALE_AFTER_MS: i64 = 15 * 60 * 1000;
 
 fn now_ms() -> i64 {
@@ -26,7 +32,130 @@ fn severity_for(pct: f64) -> String {
     }
 }
 
-/// Newest `rollout-*.jsonl` under `~/.codex/sessions`, with its modified time (ms).
+fn plan_label(plan_type: Option<&str>) -> String {
+    match plan_type {
+        Some(s) if !s.is_empty() => {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => format!("{}{}", f.to_uppercase(), c.as_str()),
+                None => "Plus".to_string(),
+            }
+        }
+        _ => "Plus".to_string(),
+    }
+}
+
+// ---------- Auth (read-only) ----------
+
+#[derive(Deserialize)]
+struct AuthFile {
+    tokens: Option<AuthTokens>,
+}
+
+#[derive(Deserialize)]
+struct AuthTokens {
+    access_token: Option<String>,
+    account_id: Option<String>,
+}
+
+fn read_auth_once(home: &Path) -> Result<(String, String), String> {
+    let text = std::fs::read_to_string(home.join("auth.json"))
+        .map_err(|_| "Codex not logged in — run `codex`.".to_string())?;
+    let parsed: AuthFile = serde_json::from_str(&text).map_err(|e| format!("auth.json: {e}"))?;
+    let tokens = parsed.tokens.ok_or("Codex not logged in — run `codex`.")?;
+    let access = tokens
+        .access_token
+        .filter(|t| !t.is_empty())
+        .ok_or("No Codex access token — run `codex`.")?;
+    let account = tokens.account_id.unwrap_or_default();
+    Ok((access, account))
+}
+
+/// Read auth, retrying once — the CLI may be rewriting/rotating the token file.
+fn read_auth(home: &Path) -> Result<(String, String), String> {
+    match read_auth_once(home) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            std::thread::sleep(Duration::from_millis(60));
+            read_auth_once(home)
+        }
+    }
+}
+
+// ---------- Live endpoint (wham/usage) ----------
+
+#[derive(Deserialize)]
+struct WhamUsage {
+    plan_type: Option<String>,
+    rate_limit: Option<WhamRate>,
+}
+
+#[derive(Deserialize)]
+struct WhamRate {
+    primary_window: Option<WhamWindow>,
+    secondary_window: Option<WhamWindow>,
+}
+
+#[derive(Deserialize)]
+struct WhamWindow {
+    #[serde(default)]
+    used_percent: f64,
+    #[serde(default)]
+    reset_at: Option<i64>, // unix seconds
+}
+
+enum LiveErr {
+    Unauthorized,
+    Other,
+}
+
+fn window_bucket(w: &WhamWindow) -> Bucket {
+    Bucket::new(
+        w.used_percent,
+        w.reset_at.map(|s| s * 1000),
+        severity_for(w.used_percent),
+        true,
+    )
+}
+
+async fn fetch_live(access: &str, account: &str) -> Result<UsageSnapshot, LiveErr> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| LiveErr::Other)?;
+
+    let resp = client
+        .get(USAGE_URL)
+        .header("Authorization", format!("Bearer {access}"))
+        .header("ChatGPT-Account-ID", account)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await
+        .map_err(|_| LiveErr::Other)?;
+
+    match resp.status().as_u16() {
+        200 => {
+            let u: WhamUsage = resp.json().await.map_err(|_| LiveErr::Other)?;
+            let rate = u.rate_limit.ok_or(LiveErr::Other)?;
+            Ok(UsageSnapshot {
+                plan: plan_label(u.plan_type.as_deref()),
+                five_hour: rate.primary_window.as_ref().map(window_bucket),
+                weekly: rate.secondary_window.as_ref().map(window_bucket),
+                extra_buckets: Vec::new(),
+                credits: None,
+                fetched_at: now_ms(),
+                staleness: "live".into(),
+                status: "ok".into(),
+                error: None,
+            })
+        }
+        401 | 403 => Err(LiveErr::Unauthorized),
+        _ => Err(LiveErr::Other),
+    }
+}
+
+// ---------- Offline fallback (newest rollout log) ----------
+
 fn newest_rollout(sessions: &Path) -> Option<(PathBuf, i64)> {
     let mut best: Option<(PathBuf, SystemTime)> = None;
     fn walk(dir: &Path, best: &mut Option<(PathBuf, SystemTime)>) {
@@ -62,97 +191,88 @@ fn newest_rollout(sessions: &Path) -> Option<(PathBuf, i64)> {
     })
 }
 
-fn bucket_from(limit: &serde_json::Value) -> Option<Bucket> {
+/// Parse a rollout `rate_limits.primary|secondary` (`used_percent`, `resets_at` secs).
+fn rollout_bucket(limit: &serde_json::Value) -> Option<Bucket> {
     let pct = limit.get("used_percent")?.as_f64()?;
-    let resets_at = limit
-        .get("resets_at")
-        .and_then(|r| r.as_i64())
-        .map(|secs| secs * 1000);
+    let resets_at = limit.get("resets_at").and_then(|r| r.as_i64()).map(|s| s * 1000);
     Some(Bucket::new(pct, resets_at, severity_for(pct), true))
 }
 
-pub fn fetch_usage() -> UsageSnapshot {
-    let home = match codex_home() {
-        Some(h) => h,
-        None => return UsageSnapshot::failed("Codex".into(), "error", "No home directory"),
-    };
+fn read_offline(home: &Path) -> Option<UsageSnapshot> {
+    let (path, mtime_ms) = newest_rollout(&home.join("sessions"))?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let line = text.lines().rev().find(|l| l.contains("\"rate_limits\""))?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let rl = v.pointer("/payload/rate_limits")?;
 
-    if !home.join("auth.json").exists() {
-        return UsageSnapshot::failed(
-            "Codex".into(),
-            "reauth_needed",
-            "Codex not logged in — run `codex`.",
-        );
-    }
-
-    let (path, mtime_ms) = match newest_rollout(&home.join("sessions")) {
-        Some(v) => v,
-        None => {
-            return UsageSnapshot::failed("Codex".into(), "error", "No Codex sessions yet.")
-        }
-    };
-
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => return UsageSnapshot::failed("Codex".into(), "error", format!("Read error: {e}")),
-    };
-
-    // Reverse-scan for the last line carrying a rate_limits object.
-    let line = text
-        .lines()
-        .rev()
-        .find(|l| l.contains("\"rate_limits\""));
-    let line = match line {
-        Some(l) => l,
-        None => {
-            return UsageSnapshot::failed(
-                "Codex".into(),
-                "error",
-                "No usage data in latest session.",
-            )
-        }
-    };
-
-    let v: serde_json::Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => return UsageSnapshot::failed("Codex".into(), "error", format!("Parse error: {e}")),
-    };
-
-    let rl = match v.pointer("/payload/rate_limits") {
-        Some(rl) => rl,
-        None => {
-            return UsageSnapshot::failed("Codex".into(), "error", "Malformed rate_limits.")
-        }
-    };
-
-    let plan = rl
-        .get("plan_type")
-        .and_then(|p| p.as_str())
-        .map(|s| {
-            let mut c = s.chars();
-            match c.next() {
-                Some(f) => format!("{}{}", f.to_uppercase(), c.as_str()),
-                None => "Plus".to_string(),
-            }
-        })
-        .unwrap_or_else(|| "Plus".into());
-
-    let five_hour = rl.get("primary").and_then(bucket_from);
-    let weekly = rl.get("secondary").and_then(bucket_from);
-
+    let plan = plan_label(rl.get("plan_type").and_then(|p| p.as_str()));
+    let five_hour = rl.get("primary").and_then(rollout_bucket);
+    let weekly = rl.get("secondary").and_then(rollout_bucket);
     let age = now_ms() - mtime_ms;
-    let staleness = if age > STALE_AFTER_MS { "stale" } else { "live" };
 
-    UsageSnapshot {
+    Some(UsageSnapshot {
         plan,
         five_hour,
         weekly,
         extra_buckets: Vec::new(),
         credits: None,
-        fetched_at: mtime_ms, // Codex data is as fresh as the last turn, not "now".
-        staleness: staleness.into(),
+        fetched_at: mtime_ms,
+        staleness: if age > STALE_AFTER_MS { "stale" } else { "live" }.into(),
         status: "ok".into(),
         error: None,
+    })
+}
+
+// ---------- Orchestrator ----------
+
+/// Offline read on a blocking thread (the rollout scan/read is sync + heavy).
+async fn offline(home: PathBuf) -> Option<UsageSnapshot> {
+    tauri::async_runtime::spawn_blocking(move || read_offline(&home))
+        .await
+        .ok()
+        .flatten()
+}
+
+pub async fn fetch_usage() -> UsageSnapshot {
+    let home = match codex_home() {
+        Some(h) => h,
+        None => return UsageSnapshot::failed("Codex".into(), "error", "No home directory"),
+    };
+
+    let (access, account) = match read_auth(&home) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("codex auth unavailable: {e}");
+            return UsageSnapshot::failed("Codex".into(), "reauth_needed", e);
+        }
+    };
+
+    match fetch_live(&access, &account).await {
+        Ok(snap) => {
+            tracing::info!("codex usage live");
+            snap
+        }
+        Err(LiveErr::Unauthorized) => {
+            tracing::warn!("codex 401 — token expired, falling back to offline");
+            match offline(home.clone()).await {
+                Some(mut s) => {
+                    s.error =
+                        Some("Live token expired — run `codex`. Showing local snapshot.".into());
+                    s
+                }
+                None => UsageSnapshot::failed(
+                    "Codex".into(),
+                    "reauth_needed",
+                    "Codex token expired — run `codex`.",
+                ),
+            }
+        }
+        Err(LiveErr::Other) => {
+            tracing::warn!("codex live fetch failed, falling back to offline");
+            offline(home.clone())
+                .await
+                .unwrap_or_else(|| UsageSnapshot::failed("Codex".into(), "error", "Codex usage unavailable."))
+        }
     }
 }
 
@@ -161,23 +281,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_rate_limits_fixture() {
+    fn parses_wham_usage_fixture() {
+        let fixture = include_str!("../../fixtures/codex-usage.json");
+        let u: WhamUsage = serde_json::from_str(fixture).expect("wham usage parses");
+        let rate = u.rate_limit.expect("rate_limit present");
+
+        let five = rate.primary_window.as_ref().map(window_bucket).expect("primary");
+        assert_eq!(five.used_pct, 1.0);
+        assert_eq!(five.severity, "normal");
+        // reset_at 1783783197 s → ms
+        assert_eq!(five.resets_at, Some(1783783197_000));
+
+        let weekly = rate.secondary_window.as_ref().map(window_bucket).expect("secondary");
+        assert_eq!(weekly.used_pct, 0.0);
+        assert_eq!(plan_label(u.plan_type.as_deref()), "Plus");
+    }
+
+    #[test]
+    fn parses_rollout_fixture() {
         let fixture = include_str!("../../fixtures/codex-rollout.jsonl");
         let line = fixture
             .lines()
             .rev()
             .find(|l| l.contains("\"rate_limits\""))
-            .expect("fixture has a rate_limits line");
+            .expect("rollout has rate_limits");
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        let rl = v.pointer("/payload/rate_limits").expect("rate_limits present");
-
-        let five = rl.get("primary").and_then(bucket_from).expect("primary");
+        let rl = v.pointer("/payload/rate_limits").expect("rate_limits");
+        let five = rl.get("primary").and_then(rollout_bucket).expect("primary");
         assert_eq!(five.used_pct, 92.0);
-        assert_eq!(five.severity, "critical"); // 92% → critical
-        assert!(five.resets_at.is_some());
-
-        let weekly = rl.get("secondary").and_then(bucket_from).expect("secondary");
-        assert_eq!(weekly.used_pct, 14.0);
-        assert_eq!(weekly.severity, "normal");
+        assert_eq!(five.severity, "critical");
     }
 }

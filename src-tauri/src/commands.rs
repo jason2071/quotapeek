@@ -1,13 +1,13 @@
 use crate::models::UsageSnapshot;
 use crate::settings::{self, Settings};
 use crate::{claude, codex};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
 #[tauri::command]
 pub async fn get_usage(provider: String) -> UsageSnapshot {
     match provider.as_str() {
-        "codex" => codex::fetch_usage(),
+        "codex" => codex::fetch_usage().await,
         _ => claude::fetch_usage().await,
     }
 }
@@ -61,4 +61,6 @@ pub fn set_refresh(app: AppHandle, secs: u64) {
     let mut s = settings::load(&app);
     s.refresh_secs = secs;
     settings::save(&app, &s);
+    // Push the new cadence to already-open widgets (no restart needed).
+    let _ = app.emit("settings-changed", secs);
 }

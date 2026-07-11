@@ -23,7 +23,7 @@ async function render(): Promise<void> {
     <div class="settings-card">
       <div class="settings-head" data-tauri-drag-region>
         <div class="settings-title" data-tauri-drag-region>Settings</div>
-        <button class="close js-close" title="Close">✕</button>
+        <button class="close js-close" title="Close" aria-label="Close settings">✕</button>
       </div>
 
       <div class="settings-section">

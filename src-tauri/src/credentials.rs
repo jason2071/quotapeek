@@ -2,7 +2,7 @@
 //! The widget stays read-only on this file — Claude Code owns refreshing it.
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct CredFile {
@@ -70,17 +70,67 @@ fn plan_label(sub: Option<&str>, tier: Option<&str>) -> String {
     base
 }
 
+fn read_oauth(path: &Path) -> Result<ClaudeOauth, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+    let parsed: CredFile =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid credentials JSON: {}", e))?;
+    parsed
+        .claude_ai_oauth
+        .ok_or_else(|| "No claudeAiOauth section — is Claude Code logged in?".to_string())
+}
+
+/// Read + parse, retrying once — the file may be caught mid-write by Claude Code,
+/// which would otherwise flash a spurious "re-auth needed" banner.
+fn read_oauth_retry(path: &Path) -> Result<ClaudeOauth, String> {
+    match read_oauth(path) {
+        Ok(o) => Ok(o),
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            read_oauth(path)
+        }
+    }
+}
+
+/// macOS: Claude Code stores the token in the login Keychain (generic password,
+/// service "Claude Code-credentials"). UNTESTED on a real Mac — the account name
+/// may need adjustment.
+#[cfg(target_os = "macos")]
+fn read_oauth_keychain() -> Result<ClaudeOauth, String> {
+    let account = std::env::var("USER").unwrap_or_default();
+    let data =
+        security_framework::passwords::get_generic_password("Claude Code-credentials", &account)
+            .map_err(|e| format!("keychain read failed: {e}"))?;
+    let text = String::from_utf8(data).map_err(|_| "keychain: non-UTF8 data".to_string())?;
+    let parsed: CredFile =
+        serde_json::from_str(&text).map_err(|e| format!("keychain JSON: {e}"))?;
+    parsed
+        .claude_ai_oauth
+        .ok_or_else(|| "keychain: no claudeAiOauth".to_string())
+}
+
+/// File first, then (macOS) the login Keychain where Claude Code may keep it.
+fn load_oauth(path: &Path) -> Result<ClaudeOauth, String> {
+    match read_oauth_retry(path) {
+        Ok(o) => Ok(o),
+        Err(e) => {
+            #[cfg(target_os = "macos")]
+            {
+                return read_oauth_keychain().map_err(|k| format!("{e} / {k}"));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Load and parse the Claude Code credentials. Returns a human-readable error
 /// string on any failure so the caller can surface it in the widget.
 pub fn load() -> Result<Credentials, String> {
     let path = credentials_path().ok_or("Could not resolve home directory")?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
-    let parsed: CredFile =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid credentials JSON: {}", e))?;
-    let oauth = parsed
-        .claude_ai_oauth
-        .ok_or("No claudeAiOauth section — is Claude Code logged in?")?;
+    let oauth = load_oauth(&path)?;
 
     if oauth.access_token.is_empty() {
         return Err("Empty access token".into());

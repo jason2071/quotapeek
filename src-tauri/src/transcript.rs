@@ -145,6 +145,19 @@ pub fn approximate() -> Option<(Bucket, Bucket)> {
 mod tests {
     use super::*;
 
+    // Hermetic: parse a synthetic assistant line — no dependency on real ~/.claude.
+    #[test]
+    fn parse_line_sums_tokens_and_excludes_cache_read() {
+        let line = r#"{"type":"assistant","timestamp":"2026-07-11T10:00:00.000Z","requestId":"req_1","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":999}}}"#;
+        let ev = parse_line(line).expect("assistant line parses");
+        assert_eq!(ev.tokens, 160); // 100 + 50 + 10, cache_read excluded
+        assert_eq!(ev.request_id, "req_1");
+        assert!(ev.ts_ms > 0);
+
+        // Non-assistant lines are skipped.
+        assert!(parse_line(r#"{"type":"user","timestamp":"2026-07-11T10:00:00.000Z"}"#).is_none());
+    }
+
     // Exercises the recursive walk + JSONL parse against the real transcripts on
     // this machine. Must not panic; token counts must be non-negative.
     #[test]
