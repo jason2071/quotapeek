@@ -7,21 +7,40 @@ mod models;
 mod settings;
 mod transcript;
 
+use std::sync::Mutex;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_window_state::StateFlags;
 
 const WIDGETS: [&str; 2] = ["claude", "codex"];
-// Default on-screen positions (offset from the primary monitor origin).
 const DEFAULT_POS: [(&str, i32, i32); 2] = [("claude", 60, 60), ("codex", 420, 60)];
 
-fn set_visible(app: &AppHandle, label: &str, visible: bool) {
+/// Tray checkable items, kept in state so visibility changes anywhere (settings,
+/// left-click, reset) can sync the checkmarks.
+pub(crate) struct TrayMenu {
+    pub claude: CheckMenuItem<Wry>,
+    pub codex: CheckMenuItem<Wry>,
+}
+
+/// Show/hide a widget window and keep its tray checkmark in sync. Does NOT persist
+/// (callers that should persist do so explicitly).
+pub(crate) fn set_widget_visible(app: &AppHandle, label: &str, visible: bool) {
     if let Some(w) = app.get_webview_window(label) {
         let _ = if visible { w.show() } else { w.hide() };
+    }
+    if let Some(tm) = app.try_state::<TrayMenu>() {
+        let item = match label {
+            "claude" => Some(&tm.claude),
+            "codex" => Some(&tm.codex),
+            _ => None,
+        };
+        if let Some(i) = item {
+            let _ = i.set_checked(visible);
+        }
     }
 }
 
@@ -32,15 +51,13 @@ fn primary_origin(app: &AppHandle) -> (i32, i32) {
         .unwrap_or((0, 0))
 }
 
-/// If a widget's title/drag area isn't inside any monitor (e.g. after a monitor
-/// unplug or DPI change), snap it back to a default on-screen position.
+/// Snap an off-screen widget (after a monitor/DPI change) back on screen.
 fn clamp_on_screen(app: &AppHandle, window: &WebviewWindow) {
     let pos = match window.outer_position() {
         Ok(p) => p,
         Err(_) => return,
     };
     let monitors = window.available_monitors().unwrap_or_default();
-    // Anchor near the top-left drag strip — that's what the user needs to reach.
     let ax = pos.x + 24;
     let ay = pos.y + 12;
     let reachable = monitors.iter().any(|m| {
@@ -60,8 +77,9 @@ fn clamp_on_screen(app: &AppHandle, window: &WebviewWindow) {
     }
 }
 
-/// Tray "Reset positions": move both widgets to defaults and show the enabled ones.
-fn reset_positions(app: &AppHandle) {
+/// Move both widgets to defaults and show the enabled ones. Callable from the tray
+/// and from Settings.
+pub(crate) fn reset_positions(app: &AppHandle) {
     let s = settings::load(app);
     let (ox, oy) = primary_origin(app);
     for (label, dx, dy) in DEFAULT_POS {
@@ -69,12 +87,13 @@ fn reset_positions(app: &AppHandle) {
             let _ = w.set_position(PhysicalPosition::new(ox + dx, oy + dy));
         }
     }
-    set_visible(app, "claude", s.show_claude);
-    set_visible(app, "codex", s.show_codex);
+    set_widget_visible(app, "claude", s.show_claude);
+    set_widget_visible(app, "codex", s.show_codex);
     tracing::info!("reset widget positions");
 }
 
-/// Tray left-click: hide all widgets if any is showing, else show the enabled ones.
+/// Tray left-click: hide all widgets if any is showing, else show the enabled ones
+/// (or open Settings if none are enabled).
 fn toggle_widgets(app: &AppHandle) {
     let any_visible = WIDGETS.iter().any(|l| {
         app.get_webview_window(l)
@@ -83,25 +102,35 @@ fn toggle_widgets(app: &AppHandle) {
     });
     if any_visible {
         for l in WIDGETS {
-            set_visible(app, l, false);
+            set_widget_visible(app, l, false);
         }
     } else {
         let s = settings::load(app);
         if !s.show_claude && !s.show_codex {
-            // Nothing enabled — open Settings so the click isn't a silent no-op.
             if let Some(w) = app.get_webview_window("settings") {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
             return;
         }
-        set_visible(app, "claude", s.show_claude);
-        set_visible(app, "codex", s.show_codex);
+        set_widget_visible(app, "claude", s.show_claude);
+        set_widget_visible(app, "codex", s.show_codex);
     }
 }
 
-/// Tray "Check for updates": check (no auto-install) and show a notification with
-/// the result. Installing happens from Settings so the user stays in control.
+/// Persist a widget's visibility (tray checkbox toggled) and apply it.
+fn persist_show(app: &AppHandle, label: &str, visible: bool) {
+    let mut s = settings::load(app);
+    match label {
+        "claude" => s.show_claude = visible,
+        "codex" => s.show_codex = visible,
+        _ => {}
+    }
+    settings::save(app, &s);
+    set_widget_visible(app, label, visible);
+}
+
+/// Tray "Check for updates": check (no auto-install) and show a notification.
 async fn tray_check_update(app: AppHandle) {
     use tauri_plugin_notification::NotificationExt;
     let status = commands::check_update(app.clone()).await;
@@ -128,7 +157,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                // Persist size + position only — NOT visibility (we control that).
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION)
                 .build(),
         )
@@ -139,6 +167,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .manage(Mutex::new(commands::Tooltip::default()))
         .invoke_handler(tauri::generate_handler![
             commands::get_usage,
             commands::get_settings,
@@ -148,24 +177,58 @@ pub fn run() {
             commands::set_refresh,
             commands::check_update,
             commands::install_update,
+            commands::report_usage,
+            commands::notify,
+            commands::reset_positions,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // macOS: run as a menubar-only accessory (no Dock icon / Cmd-Tab entry).
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // ---- Tray icon + menu ----
+            let s = settings::load(&handle);
+
+            // ---- Tray menu ----
             let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-            let reset_i =
-                MenuItem::with_id(app, "reset", "Reset positions", true, None::<&str>)?;
+            let claude_i = CheckMenuItem::with_id(
+                app,
+                "show_claude",
+                "Show Claude widget",
+                true,
+                s.show_claude,
+                None::<&str>,
+            )?;
+            let codex_i = CheckMenuItem::with_id(
+                app,
+                "show_codex",
+                "Show Codex widget",
+                true,
+                s.show_codex,
+                None::<&str>,
+            )?;
+            let refresh_i = MenuItem::with_id(app, "refresh", "Refresh now", true, None::<&str>)?;
+            let reset_i = MenuItem::with_id(app, "reset", "Reset positions", true, None::<&str>)?;
             let update_i =
                 MenuItem::with_id(app, "update", "Check for updates", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&settings_i, &reset_i, &update_i, &quit_i])?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let sep3 = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &settings_i, &sep1, &claude_i, &codex_i, &refresh_i, &sep2, &reset_i, &update_i,
+                    &sep3, &quit_i,
+                ],
+            )?;
 
-            let mut tray = TrayIconBuilder::new()
+            app.manage(TrayMenu {
+                claude: claude_i.clone(),
+                codex: codex_i.clone(),
+            });
+
+            let mut tray = TrayIconBuilder::with_id("main")
                 .tooltip("QuotaPeek — AI usage")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -175,6 +238,21 @@ pub fn run() {
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
+                    }
+                    "show_claude" => {
+                        if let Some(tm) = app.try_state::<TrayMenu>() {
+                            let v = tm.claude.is_checked().unwrap_or(true);
+                            persist_show(app, "claude", v);
+                        }
+                    }
+                    "show_codex" => {
+                        if let Some(tm) = app.try_state::<TrayMenu>() {
+                            let v = tm.codex.is_checked().unwrap_or(true);
+                            persist_show(app, "codex", v);
+                        }
+                    }
+                    "refresh" => {
+                        let _ = app.emit("force-refresh", ());
                     }
                     "reset" => reset_positions(app),
                     "update" => {
@@ -200,7 +278,6 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
-            // macOS: use a monochrome template icon that adapts to the menubar.
             #[cfg(target_os = "macos")]
             if let Ok(img) =
                 tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
@@ -209,21 +286,18 @@ pub fn run() {
             }
             tray.build(app)?;
 
-            // ---- Apply saved settings + clamp any off-screen widget ----
-            let s = settings::load(&handle);
+            // ---- Apply saved settings + clamp off-screen widgets ----
             for label in WIDGETS {
                 if let Some(w) = handle.get_webview_window(label) {
                     clamp_on_screen(&handle, &w);
                     let _ = w.set_always_on_top(s.always_on_top);
                 }
             }
-            set_visible(&handle, "claude", s.show_claude);
-            set_visible(&handle, "codex", s.show_codex);
+            set_widget_visible(&handle, "claude", s.show_claude);
+            set_widget_visible(&handle, "codex", s.show_codex);
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing a window (only the settings panel has an affordance) hides it
-            // instead of quitting — the app lives in the tray until "Quit".
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "settings" {
                     let _ = window.hide();

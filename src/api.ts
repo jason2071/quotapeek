@@ -32,3 +32,15 @@ export function checkUpdate(): Promise<UpdateStatus> {
 export function installUpdate(): Promise<void> {
   return invoke("install_update");
 }
+
+export function reportUsage(provider: string, usedPct: number | null): Promise<void> {
+  return invoke("report_usage", { provider, usedPct });
+}
+
+export function notify(title: string, body: string): Promise<void> {
+  return invoke("notify", { title, body });
+}
+
+export function resetPositions(): Promise<void> {
+  return invoke("reset_positions");
+}

@@ -5,6 +5,7 @@ import {
   checkUpdate,
   getSettings,
   installUpdate,
+  resetPositions,
   setAlwaysOnTop,
   setAutostart,
   setRefresh,
@@ -80,6 +81,7 @@ async function render(): Promise<void> {
         <div class="settings-section-title">Widgets</div>
         <label class="opt"><span>Show Claude widget</span><input type="checkbox" class="js-claude" ${s.showClaude ? "checked" : ""} /></label>
         <label class="opt"><span>Show Codex widget</span><input type="checkbox" class="js-codex" ${s.showCodex ? "checked" : ""} /></label>
+        <div class="update-row"><button class="btn js-reset-pos">Reset widget positions</button></div>
       </div>
 
       <div class="settings-section">
@@ -113,6 +115,8 @@ async function render(): Promise<void> {
 
   const checkBtn = root.querySelector<HTMLButtonElement>(".js-check");
   if (checkBtn) checkBtn.onclick = () => void runUpdateCheck();
+
+  root.querySelector(".js-reset-pos")?.addEventListener("click", () => void resetPositions());
 
   getVersion()
     .then((v) => {

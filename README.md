@@ -25,19 +25,23 @@ Both: "Last updated" + manual refresh; re-auth and rate-limit banners.
 
 ## Tray + Settings
 
-The tray icon (menu: **Settings**, **Reset positions**, **Check for updates**,
-**Quit**) is the control center — left-click toggles the widgets, **Settings**
-opens the panel, **Reset positions** snaps off-screen widgets back, **Quit** exits.
-Closing the Settings panel only hides it; the app keeps running in the tray until
-**Quit**.
+The tray icon is the control center. Its **tooltip shows live usage**
+(`Claude 39% · Codex 1%`). **Left-click** toggles the widgets. The menu has:
+**Settings**, **Show Claude widget** / **Show Codex widget** (checkable),
+**Refresh now**, **Reset positions**, **Check for updates**, **Quit**. Closing the
+Settings panel only hides it; the app keeps running in the tray until **Quit**.
 
 **Settings** panel:
-- Show Claude widget / Show Codex widget (independent)
+- Show Claude widget / Show Codex widget (independent) + **Reset widget positions**
 - Start at login
 - Always on top
 - Refresh interval (30s / 1m / 1.5m / 2m / 5m)
+- **Updates**: current version + Check for updates (with status + install)
 
 Settings persist to `settings.json` in the app config dir.
+
+**Near-limit alerts:** a native notification fires once when a bucket crosses
+**80%** and **95%** usage (per session/weekly, reset when it drops back down).
 
 ## How it gets the data
 
@@ -126,6 +130,37 @@ endpoint (`plugins.updater.endpoints` in `tauri.conf.json` → GitHub Releases
 
 The private key `src-tauri/quotapeek-updater.key` is git-ignored — **keep it safe;
 losing it breaks updates.** The public key is in `tauri.conf.json`.
+
+## Code signing (config only — needs real certificates)
+
+The build is currently **unsigned**, so Windows SmartScreen and macOS Gatekeeper
+will warn on first run. Signing needs paid certificates I don't have, so it isn't
+enabled here. To enable it when you have certs, add to `tauri.conf.json`:
+
+**Windows** (`bundle.windows`):
+```jsonc
+"windows": {
+  "certificateThumbprint": "<SHA1 thumbprint of your code-signing cert>",
+  "digestAlgorithm": "sha256",
+  "timestampUrl": "http://timestamp.digicert.com"
+}
+```
+(Or set `signCommand` to use `azuresigntool`/an HSM.)
+
+**macOS** (`bundle.macOS`) + notarization:
+```jsonc
+"macOS": {
+  "signingIdentity": "Developer ID Application: Your Name (TEAMID)",
+  "entitlements": "entitlements.plist",
+  "providerShortName": "TEAMID"
+}
+```
+Notarize at build time with env vars `APPLE_ID`, `APPLE_PASSWORD` (app-specific),
+`APPLE_TEAM_ID` (Tauri runs `notarytool` automatically when they're set).
+
+The **updater** is signed separately from the OS code-signing above — it uses the
+minisign key in `tauri.conf.json` `plugins.updater.pubkey` (see Updates), which is
+already generated.
 
 ## macOS note (written, UNTESTED — no Mac to verify)
 

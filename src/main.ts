@@ -1,6 +1,6 @@
 import "./style.css";
 import { listen } from "@tauri-apps/api/event";
-import { getSettings, getUsage } from "./api";
+import { getSettings, getUsage, notify, reportUsage } from "./api";
 import { countdownText, renderSnapshot } from "./render";
 import type { UsageSnapshot } from "./types";
 
@@ -50,6 +50,8 @@ async function load(force = false): Promise<void> {
     const snap = await getUsage(provider);
     last = snap;
     paint(snap);
+    reportTooltip(snap);
+    checkLimits(snap);
   } catch (e) {
     paint(errorSnapshot(String(e)));
   } finally {
@@ -100,6 +102,36 @@ function tick(): void {
   }
 }
 
+// Report a headline % to the tray tooltip (max of session/weekly; null in approx).
+function reportTooltip(s: UsageSnapshot): void {
+  const hasData = s.fiveHour != null || s.weekly != null;
+  const headline = Math.max(s.fiveHour?.usedPct ?? 0, s.weekly?.usedPct ?? 0);
+  void reportUsage(provider, hasData ? headline : null);
+}
+
+// Near-limit warnings: notify once when a bucket crosses 80% / 95% (rising edge).
+const notifiedLevel: Record<string, number> = { session: 0, weekly: 0 };
+function levelFor(pct: number): number {
+  return pct >= 95 ? 95 : pct >= 80 ? 80 : 0;
+}
+function checkLimits(s: UsageSnapshot): void {
+  const rows: [string, number | null | undefined, string][] = [
+    ["session", s.fiveHour?.tokens != null ? null : s.fiveHour?.usedPct, "5-hour session"],
+    ["weekly", s.weekly?.tokens != null ? null : s.weekly?.usedPct, "weekly limit"],
+  ];
+  for (const [key, pct, label] of rows) {
+    if (pct == null) continue;
+    const lvl = levelFor(pct);
+    if (lvl > notifiedLevel[key]) {
+      void notify(
+        `${s.plan} — ${label} at ${Math.round(pct)}%`,
+        lvl >= 95 ? "Almost out — usage is very high." : "Heads up — usage is getting high.",
+      );
+    }
+    notifiedLevel[key] = lvl;
+  }
+}
+
 // Pause polling while the widget is hidden; force a fresh load when shown.
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
@@ -136,6 +168,9 @@ async function init(): Promise<void> {
       if (!document.hidden) schedule(pollMs);
     }
   });
+
+  // Tray "Refresh now" → force an immediate reload.
+  await listen("force-refresh", () => void load(true));
 }
 
 void init();

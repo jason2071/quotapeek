@@ -51,7 +51,7 @@
         "title": "Settings",
         "url": "settings.html",
         "width": 360,
-        "height": 410,
+        "height": 448,
         "resizable": false,
         "decorations": false,
         "transparent": true,

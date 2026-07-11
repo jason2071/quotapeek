@@ -28,9 +28,59 @@ pub fn set_show(app: AppHandle, provider: String, visible: bool) {
         _ => {}
     }
     settings::save(&app, &s);
-    if let Some(w) = app.get_webview_window(&provider) {
-        let _ = if visible { w.show() } else { w.hide() };
+    crate::set_widget_visible(&app, &provider, visible);
+}
+
+/// Latest headline usage % per provider, for the tray tooltip.
+#[derive(Default)]
+pub struct Tooltip {
+    pub claude: Option<f64>,
+    pub codex: Option<f64>,
+}
+
+/// Widgets report their headline % after each fetch → live tray tooltip.
+#[tauri::command]
+pub fn report_usage(app: AppHandle, provider: String, used_pct: Option<f64>) {
+    let state = match app.try_state::<std::sync::Mutex<Tooltip>>() {
+        Some(s) => s,
+        None => return,
+    };
+    let tip = {
+        let mut t = state.lock().unwrap();
+        match provider.as_str() {
+            "claude" => t.claude = used_pct,
+            "codex" => t.codex = used_pct,
+            _ => {}
+        }
+        let mut parts = Vec::new();
+        if let Some(c) = t.claude {
+            parts.push(format!("Claude {}%", c.round() as i64));
+        }
+        if let Some(x) = t.codex {
+            parts.push(format!("Codex {}%", x.round() as i64));
+        }
+        if parts.is_empty() {
+            "QuotaPeek — AI usage".to_string()
+        } else {
+            parts.join("  ·  ")
+        }
+    };
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(tip));
     }
+}
+
+/// Show a native notification (used for near-limit warnings from the widgets).
+#[tauri::command]
+pub fn notify(app: AppHandle, title: String, body: String) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// Reset widget positions (exposed to Settings; shares the tray logic).
+#[tauri::command]
+pub fn reset_positions(app: AppHandle) {
+    crate::reset_positions(&app);
 }
 
 #[tauri::command]
