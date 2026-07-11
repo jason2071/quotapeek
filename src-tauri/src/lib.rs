@@ -100,31 +100,24 @@ fn toggle_widgets(app: &AppHandle) {
     }
 }
 
-/// Tray "Check for updates": if a newer *signed* release exists at the configured
-/// endpoint, download, install, and restart. Logged; graceful when none/offline.
-async fn check_update(app: AppHandle) {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = match app.updater() {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!("updater unavailable: {e}");
-            return;
-        }
+/// Tray "Check for updates": check (no auto-install) and show a notification with
+/// the result. Installing happens from Settings so the user stays in control.
+async fn tray_check_update(app: AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let status = commands::check_update(app.clone()).await;
+    tracing::info!(status = %status.status, "tray update check");
+    let (title, body): (&str, String) = match status.status.as_str() {
+        "available" => (
+            "Update available",
+            format!(
+                "QuotaPeek {} is available. Open Settings to install.",
+                status.version.unwrap_or_default()
+            ),
+        ),
+        "uptodate" => ("QuotaPeek", "You're up to date.".to_string()),
+        _ => ("Update check failed", status.message.unwrap_or_default()),
     };
-    match updater.check().await {
-        Ok(Some(update)) => {
-            tracing::info!(version = %update.version, "update available; installing");
-            match update.download_and_install(|_chunk, _total| {}, || {}).await {
-                Ok(_) => {
-                    tracing::info!("update installed; restarting");
-                    app.restart();
-                }
-                Err(e) => tracing::warn!("update install failed: {e}"),
-            }
-        }
-        Ok(None) => tracing::info!("no update available"),
-        Err(e) => tracing::warn!("update check failed: {e}"),
-    }
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -145,6 +138,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_usage,
             commands::get_settings,
@@ -152,6 +146,8 @@ pub fn run() {
             commands::set_autostart,
             commands::set_always_on_top,
             commands::set_refresh,
+            commands::check_update,
+            commands::install_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -183,7 +179,7 @@ pub fn run() {
                     "reset" => reset_positions(app),
                     "update" => {
                         let handle = app.clone();
-                        tauri::async_runtime::spawn(check_update(handle));
+                        tauri::async_runtime::spawn(tray_check_update(handle));
                     }
                     "quit" => {
                         tracing::info!("quit from tray");

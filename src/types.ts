@@ -47,3 +47,9 @@ export interface Settings {
   alwaysOnTop: boolean;
   refreshSecs: number;
 }
+
+export interface UpdateStatus {
+  status: "available" | "uptodate" | "error" | string;
+  version: string | null;
+  message: string | null;
+}

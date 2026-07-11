@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Settings, UsageSnapshot } from "./types";
+import type { Settings, UpdateStatus, UsageSnapshot } from "./types";
 
 export function getUsage(provider: string): Promise<UsageSnapshot> {
   return invoke<UsageSnapshot>("get_usage", { provider });
@@ -23,4 +23,12 @@ export function setAlwaysOnTop(enabled: boolean): Promise<void> {
 
 export function setRefresh(secs: number): Promise<void> {
   return invoke("set_refresh", { secs });
+}
+
+export function checkUpdate(): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>("check_update");
+}
+
+export function installUpdate(): Promise<void> {
+  return invoke("install_update");
 }

@@ -385,3 +385,44 @@ body[data-provider="codex"] .bar-weekly .bar-fill {
 .opt select option {
   color: #000;
 }
+
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 11px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn.primary {
+  background: linear-gradient(135deg, #4f8cff, #38bdf8);
+  border-color: transparent;
+  color: #fff;
+}
+.version {
+  font-size: 12px;
+}
+.update-status {
+  font-size: 11px;
+  color: var(--muted);
+}
+.update-status.ok {
+  color: #34d399;
+}
+.update-status.err {
+  color: #fca5a5;
+}
