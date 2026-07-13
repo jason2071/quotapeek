@@ -101,6 +101,8 @@ struct WhamWindow {
     #[serde(default)]
     used_percent: f64,
     #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
     reset_at: Option<i64>, // unix seconds
 }
 
@@ -109,6 +111,12 @@ enum LiveErr {
     Other,
 }
 
+// The 5-hour vs weekly windows are NOT fixed to primary/secondary — the API puts
+// whichever is currently active in `primary_window` (e.g. when there's no recent
+// 5h usage, `primary_window` IS the weekly one and `secondary_window` is null).
+// Classify by window length instead of position.
+const FIVE_HOUR_MAX_SECS: i64 = 6 * 3600;
+
 fn window_bucket(w: &WhamWindow) -> Bucket {
     Bucket::new(
         w.used_percent,
@@ -116,6 +124,25 @@ fn window_bucket(w: &WhamWindow) -> Bucket {
         severity_for(w.used_percent),
         true,
     )
+}
+
+fn zero_bucket() -> Bucket {
+    Bucket::new(0.0, None, "normal".into(), false)
+}
+
+/// Sort the available windows into (five_hour, weekly) by their length.
+fn classify(windows: &[Option<&WhamWindow>]) -> (Bucket, Bucket) {
+    let mut five: Option<Bucket> = None;
+    let mut weekly: Option<Bucket> = None;
+    for w in windows.iter().copied().flatten() {
+        let secs = w.limit_window_seconds.unwrap_or(0);
+        if secs > 0 && secs <= FIVE_HOUR_MAX_SECS {
+            five.get_or_insert_with(|| window_bucket(w));
+        } else if secs > FIVE_HOUR_MAX_SECS {
+            weekly.get_or_insert_with(|| window_bucket(w));
+        }
+    }
+    (five.unwrap_or_else(zero_bucket), weekly.unwrap_or_else(zero_bucket))
 }
 
 async fn fetch_live(access: &str, account: &str) -> Result<UsageSnapshot, LiveErr> {
@@ -137,10 +164,14 @@ async fn fetch_live(access: &str, account: &str) -> Result<UsageSnapshot, LiveEr
         200 => {
             let u: WhamUsage = resp.json().await.map_err(|_| LiveErr::Other)?;
             let rate = u.rate_limit.ok_or(LiveErr::Other)?;
+            let (five_hour, weekly) = classify(&[
+                rate.primary_window.as_ref(),
+                rate.secondary_window.as_ref(),
+            ]);
             Ok(UsageSnapshot {
                 plan: plan_label(u.plan_type.as_deref()),
-                five_hour: rate.primary_window.as_ref().map(window_bucket),
-                weekly: rate.secondary_window.as_ref().map(window_bucket),
+                five_hour: Some(five_hour),
+                weekly: Some(weekly),
                 extra_buckets: Vec::new(),
                 credits: None,
                 fetched_at: now_ms(),
@@ -191,11 +222,12 @@ fn newest_rollout(sessions: &Path) -> Option<(PathBuf, i64)> {
     })
 }
 
-/// Parse a rollout `rate_limits.primary|secondary` (`used_percent`, `resets_at` secs).
-fn rollout_bucket(limit: &serde_json::Value) -> Option<Bucket> {
+/// Parse a rollout window: returns (window_minutes, Bucket) for classification.
+fn rollout_window(limit: &serde_json::Value) -> Option<(i64, Bucket)> {
     let pct = limit.get("used_percent")?.as_f64()?;
+    let wmin = limit.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0);
     let resets_at = limit.get("resets_at").and_then(|r| r.as_i64()).map(|s| s * 1000);
-    Some(Bucket::new(pct, resets_at, severity_for(pct), true))
+    Some((wmin, Bucket::new(pct, resets_at, severity_for(pct), true)))
 }
 
 fn read_offline(home: &Path) -> Option<UsageSnapshot> {
@@ -206,14 +238,24 @@ fn read_offline(home: &Path) -> Option<UsageSnapshot> {
     let rl = v.pointer("/payload/rate_limits")?;
 
     let plan = plan_label(rl.get("plan_type").and_then(|p| p.as_str()));
-    let five_hour = rl.get("primary").and_then(rollout_bucket);
-    let weekly = rl.get("secondary").and_then(rollout_bucket);
+    // Classify by window length (same reasoning as the live path).
+    let mut five: Option<Bucket> = None;
+    let mut weekly: Option<Bucket> = None;
+    for key in ["primary", "secondary"] {
+        if let Some((wmin, b)) = rl.get(key).and_then(rollout_window) {
+            if wmin > 0 && wmin <= 360 {
+                five.get_or_insert(b);
+            } else if wmin > 360 {
+                weekly.get_or_insert(b);
+            }
+        }
+    }
     let age = now_ms() - mtime_ms;
 
     Some(UsageSnapshot {
         plan,
-        five_hour,
-        weekly,
+        five_hour: Some(five.unwrap_or_else(zero_bucket)),
+        weekly: Some(weekly.unwrap_or_else(zero_bucket)),
         extra_buckets: Vec::new(),
         credits: None,
         fetched_at: mtime_ms,
@@ -281,20 +323,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_wham_usage_fixture() {
+    fn wham_classifies_windows_by_length() {
         let fixture = include_str!("../../fixtures/codex-usage.json");
         let u: WhamUsage = serde_json::from_str(fixture).expect("wham usage parses");
         let rate = u.rate_limit.expect("rate_limit present");
-
-        let five = rate.primary_window.as_ref().map(window_bucket).expect("primary");
-        assert_eq!(five.used_pct, 1.0);
-        assert_eq!(five.severity, "normal");
-        // reset_at 1783783197 s → ms
+        let (five, weekly) =
+            classify(&[rate.primary_window.as_ref(), rate.secondary_window.as_ref()]);
+        assert_eq!(five.used_pct, 1.0); // 18000s window
         assert_eq!(five.resets_at, Some(1783783197_000));
-
-        let weekly = rate.secondary_window.as_ref().map(window_bucket).expect("secondary");
-        assert_eq!(weekly.used_pct, 0.0);
+        assert_eq!(weekly.used_pct, 0.0); // 604800s window
         assert_eq!(plan_label(u.plan_type.as_deref()), "Plus");
+    }
+
+    // Regression: when there's no active 5h window the API puts the WEEKLY window
+    // in `primary_window` and leaves `secondary_window` null. It must map to weekly,
+    // not to "Current session".
+    #[test]
+    fn wham_weekly_only_maps_to_weekly() {
+        let json = r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":604800,"reset_at":1784542515},"secondary_window":null}}"#;
+        let u: WhamUsage = serde_json::from_str(json).unwrap();
+        let rate = u.rate_limit.unwrap();
+        let (five, weekly) =
+            classify(&[rate.primary_window.as_ref(), rate.secondary_window.as_ref()]);
+        assert_eq!(weekly.used_pct, 3.0);
+        assert_eq!(weekly.resets_at, Some(1784542515_000));
+        assert_eq!(five.used_pct, 0.0); // no 5h window → 0%
+        assert_eq!(five.resets_at, None);
     }
 
     #[test]
@@ -307,8 +361,12 @@ mod tests {
             .expect("rollout has rate_limits");
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         let rl = v.pointer("/payload/rate_limits").expect("rate_limits");
-        let five = rl.get("primary").and_then(rollout_bucket).expect("primary");
+        let (wmin, five) = rl.get("primary").and_then(rollout_window).expect("primary");
+        assert_eq!(wmin, 300);
         assert_eq!(five.used_pct, 92.0);
         assert_eq!(five.severity, "critical");
+        let (wmin2, weekly) = rl.get("secondary").and_then(rollout_window).expect("secondary");
+        assert_eq!(wmin2, 10080);
+        assert_eq!(weekly.used_pct, 14.0);
     }
 }
