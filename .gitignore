@@ -8,3 +8,5 @@ src-tauri/gen/schemas
 
 # Updater signing private key — NEVER commit
 src-tauri/*.key
+
+ui/
